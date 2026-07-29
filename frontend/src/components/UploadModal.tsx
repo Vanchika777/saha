@@ -4,7 +4,7 @@ import { api } from '../utils/api';
 import { X, UploadCloud, FileText, Loader2 } from 'lucide-react';
 
 export const UploadModal: React.FC = () => {
-  const { isUploadModalOpen, closeUploadModal, addBook } = useBookStore();
+  const { isUploadModalOpen, closeUploadModal, addBook, toggleBookSelection } = useBookStore();
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -44,6 +44,7 @@ export const UploadModal: React.FC = () => {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
       addBook(res.data.book);
+      toggleBookSelection(res.data.book.id);
       closeUploadModal();
       setFile(null);
     } catch (err: any) {

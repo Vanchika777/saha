@@ -3,12 +3,12 @@ import { useChatStore } from '../store/chatStore';
 import { useBookStore } from '../store/bookStore';
 import { ChatMessage } from './ChatMessage';
 import { api, API_BASE_URL } from '../utils/api';
-import { Send, Bot, RefreshCw } from 'lucide-react';
+import { Send, Bot, RefreshCw, Paperclip } from 'lucide-react';
 import type { ChatMessage as ChatMessageType } from '../types';
 
 export const ChatWindow: React.FC = () => {
   const { currentSession, messages, isStreaming, activeStreamToken, setCurrentSession, addMessage, setIsStreaming, appendStreamToken, clearStreamToken } = useChatStore();
-  const { books, selectedBookIds } = useBookStore();
+  const { books, selectedBookIds, openUploadModal } = useBookStore();
   const [inputMessage, setInputMessage] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -220,6 +220,15 @@ export const ChatWindow: React.FC = () => {
             alignItems: 'center',
           }}
         >
+          <button
+            type="button"
+            className="btn btn-ghost btn-icon"
+            onClick={openUploadModal}
+            title="Upload a PDF to chat about"
+            style={{ flexShrink: 0 }}
+          >
+            <Paperclip size={18} />
+          </button>
           <input
             className="input"
             type="text"

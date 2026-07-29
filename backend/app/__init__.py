@@ -11,6 +11,19 @@ def create_app():
     # Allow requests from React frontend
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
+    app.db = get_db()
+
+    from app.routes.auth import auth_bp
+    from app.routes.books import books_bp
+    from app.routes.chat import chat_bp
+    from app.routes.recommend import recommend_bp
+
+    app.register_blueprint(auth_bp, url_prefix="/api/auth")
+    app.register_blueprint(books_bp, url_prefix="/api/books")
+    app.register_blueprint(chat_bp, url_prefix="/api/chat")
+    app.register_blueprint(recommend_bp, url_prefix="/api/recommend")
+
+
     # Health check route to test DB connectivity
     @app.route("/api/health", methods=["GET"])
     def health_check():

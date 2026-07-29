@@ -1,12 +1,9 @@
 import React from 'react';
 import { useAuthStore } from '../store/authStore';
-import { useBookStore } from '../store/bookStore';
-import { BookOpen, Upload, LogIn, LogOut, User as UserIcon } from 'lucide-react';
+import { BookOpen, LogIn, LogOut, User as UserIcon } from 'lucide-react';
 
 export const Navbar: React.FC = () => {
   const { user, openAuthModal, logout } = useAuthStore();
-  const { openUploadModal } = useBookStore();
-
   return (
     <header style={{
       position: 'fixed',
@@ -49,14 +46,6 @@ export const Navbar: React.FC = () => {
 
         {/* Action Buttons */}
         <div className="flex items-center gap-4">
-          <button
-            className="btn btn-ghost flex items-center gap-2"
-            onClick={openUploadModal}
-          >
-            <Upload size={16} />
-            <span>Upload PDF</span>
-          </button>
-
           {user ? (
             <div className="flex items-center gap-3" style={{ background: 'var(--color-surface-2)', padding: '6px 12px', borderRadius: 'var(--radius-full)', border: '1px solid var(--color-border)' }}>
               {user.avatar_url ? (
