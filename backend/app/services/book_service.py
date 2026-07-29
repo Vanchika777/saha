@@ -1,11 +1,11 @@
 """
 Book service: orchestrates the full upload pipeline.
-  1. Upload PDF to R2
+  1. Upload PDF to R2 or local disk fallback
   2. Parse metadata + extract cover
   3. Fetch cover from APIs if not embedded
-  4. Upload cover to R2
+  4. Upload cover
   5. Save book document to MongoDB
-  6. Enqueue Celery task for background embedding
+  6. Enqueue background embedding (or embed synchronously)
 """
 import io
 from typing import Optional
@@ -26,12 +26,9 @@ def create_book(
     original_filename: str,
 ) -> dict:
     """
-    Full book upload pipeline (synchronous part).
-    Embedding is queued as a background Celery task.
-
-    Returns the newly created book document (public representation).
+    Full book upload pipeline.
     """
-    # ── 1. Upload PDF to R2 ───────────────────────────────────
+    # ── 1. Upload PDF ─────────────────────────────────────────
     pdf_key, _ = r2_storage.upload_file(
         pdf_bytes,
         content_type="application/pdf",
@@ -47,7 +44,6 @@ def create_book(
     cover_url = None
 
     if parsed.cover_bytes:
-        # Upload embedded cover to R2
         cover_key, cover_url = r2_storage.upload_file(
             parsed.cover_bytes,
             content_type=f"image/{parsed.cover_ext}",
@@ -55,12 +51,10 @@ def create_book(
             extension=parsed.cover_ext,
         )
     else:
-        # Fetch cover from Open Library / Google Books
         cover_url = fetch_cover_url(
             title=parsed.title,
             author=parsed.author,
         )
-        # We store the external URL directly (no R2 upload for external URLs)
 
     # ── 4. Build and insert MongoDB document ──────────────────
     book_doc = BookModel.new(
@@ -93,7 +87,7 @@ def create_book(
 
 
 def _update_reading_profile(db, user_id: str, parsed) -> None:
-    """Increment genre/author/language counts in the user's reading profile."""
+    """Increment genre/author/language counts in user profile (logged-in only)."""
     updates = {}
     if parsed.language:
         updates[f"reading_profile.languages.{parsed.language}"] = 1
@@ -102,21 +96,24 @@ def _update_reading_profile(db, user_id: str, parsed) -> None:
         updates[f"reading_profile.authors.{safe_author}"] = 1
 
     if updates:
-        db.users.update_one(
-            {"_id": ObjectId(user_id)},
-            {"$inc": updates, "$set": {"updated_at": datetime.now(timezone.utc)}},
-        )
+        try:
+            user_obj_id = ObjectId(user_id)
+            db.users.update_one(
+                {"_id": user_obj_id},
+                {"$inc": updates, "$set": {"updated_at": datetime.now(timezone.utc)}},
+            )
+        except Exception:
+            pass  # Guest user ID string, skip reading profile update
 
 
 def _enqueue_embedding(
     book_id: str, user_id: str, chunks: list, title: str
 ) -> None:
-    """Queue the embedding job. Falls back to synchronous if Celery unavailable."""
+    """Queue embedding job or embed synchronously."""
     try:
         from app.tasks import embed_book_task
         embed_book_task.delay(book_id, user_id, chunks, title)
     except Exception:
-        # Celery not running — embed synchronously (blocks request, dev only)
         _embed_synchronously(book_id, user_id, chunks, title)
 
 
@@ -126,9 +123,16 @@ def _embed_synchronously(
     from app.utils.embedder import embed_chunks
     from pymongo import MongoClient
     from app.config import Config
-    import certifi
 
-    client = MongoClient(Config.MONGO_URI, tlsCAFile=certifi.where())
+    kwargs = {}
+    if Config.MONGO_URI.startswith("mongodb+srv://"):
+        try:
+            import certifi
+            kwargs["tlsCAFile"] = certifi.where()
+        except ImportError:
+            pass
+
+    client = MongoClient(Config.MONGO_URI, **kwargs)
     db = client[Config.MONGO_DB_NAME]
 
     try:
@@ -148,6 +152,7 @@ def _embed_synchronously(
             },
         )
     except Exception as e:
+        print(f"[Embedding Error]: {e}")
         db.books.update_one(
             {"_id": ObjectId(book_id)},
             {"$set": {"embedding_status": EmbeddingStatus.FAILED}},

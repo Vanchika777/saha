@@ -1,0 +1,29 @@
+app = "saha-backend"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "5000"
+  FLASK_ENV = "production"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 5000
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.concurrency]]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[mounts]
+  source = "chroma_data"
+  destination = "/app/chroma_data"
