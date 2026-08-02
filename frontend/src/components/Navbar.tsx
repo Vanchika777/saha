@@ -4,6 +4,14 @@ import { BookOpen, LogIn, LogOut, User as UserIcon } from 'lucide-react';
 
 export const Navbar: React.FC = () => {
   const { user, openAuthModal, logout } = useAuthStore();
+
+  // Safely extract display name without triggering TypeScript errors on missing properties
+  const rawUser = user as Record<string, any> | null;
+  const displayName = 
+    rawUser?.display_name || 
+    rawUser?.name || 
+    (user?.email ? user.email.split('@')[0] : 'User');
+
   return (
     <header style={{
       position: 'fixed',
@@ -19,7 +27,7 @@ export const Navbar: React.FC = () => {
       display: 'flex',
       alignItems: 'center'
     }}>
-      <div className="container flex items-center justify-between">
+      <div className="container flex items-center justify-between" style={{ width: '100%', maxWidth: '1200px', margin: '0 auto', padding: '0 24px' }}>
         {/* Logo */}
         <div className="flex items-center gap-3">
           <div style={{
@@ -47,15 +55,15 @@ export const Navbar: React.FC = () => {
         {/* Action Buttons */}
         <div className="flex items-center gap-4">
           {user ? (
-            <div className="flex items-center gap-3" style={{ background: 'var(--color-surface-2)', padding: '6px 12px', borderRadius: 'var(--radius-full)', border: '1px solid var(--color-border)' }}>
-              {user.avatar_url ? (
-                <img src={user.avatar_url} alt={user.display_name} style={{ width: '28px', height: '28px', borderRadius: '50%' }} />
+            <div className="flex items-center gap-3" style={{ background: 'var(--color-surface-2)', padding: '6px 14px', borderRadius: 'var(--radius-full)', border: '1px solid var(--color-border)' }}>
+              {rawUser?.avatar_url ? (
+                <img src={rawUser.avatar_url} alt={displayName} style={{ width: '28px', height: '28px', borderRadius: '50%' }} />
               ) : (
                 <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: 'var(--color-primary)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                   <UserIcon size={14} color="#ffffff" />
                 </div>
               )}
-              <span style={{ fontSize: '0.85rem', fontWeight: 500 }}>{user.display_name}</span>
+              <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>{displayName}</span>
               <button
                 onClick={logout}
                 title="Logout"

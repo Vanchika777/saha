@@ -3,6 +3,7 @@ Chat routes: create session, send message (streaming via SSE),
 fetch history. Supports both authenticated users and guests.
 """
 import json
+import uuid
 from flask import Blueprint, request, jsonify, current_app, g, Response, stream_with_context
 from bson import ObjectId
 from datetime import datetime, timezone
@@ -14,39 +15,72 @@ from app.services.rag_service import stream_answer, answer_question
 chat_bp = Blueprint("chat", __name__)
 
 
+def _sanitize_doc(doc: dict) -> dict:
+    """Ensure BSON types like ObjectId and datetime are converted to JSON-serializable types."""
+    if not doc:
+        return {}
+    
+    clean_doc = dict(doc)
+    
+    if "_id" in clean_doc:
+        clean_doc["_id"] = str(clean_doc["_id"])
+        
+    for key in ["created_at", "updated_at", "expires_at"]:
+        if key in clean_doc and isinstance(clean_doc[key], datetime):
+            clean_doc[key] = clean_doc[key].isoformat()
+
+    return clean_doc
+
+
 @chat_bp.post("/sessions")
 @optional_auth
 def create_session():
     """
     Create a new chat session.
     Guests get a session with a 24-hour TTL.
-    Body: { title?: str, book_ids?: [str] }
     """
-    data = request.get_json(silent=True) or {}
-    book_ids = data.get("book_ids", [])
-    title = data.get("title", "New Conversation")
+    try:
+        data = request.get_json(silent=True) or {}
+        book_ids = data.get("book_ids", [])
+        title = data.get("title", "New Conversation")
 
-    is_guest = g.user_id is None
-    session_doc = ChatSessionModel.new(
-        user_id=g.user_id,
-        title=title,
-        book_ids=book_ids,
-        is_guest=is_guest,
-    )
-    result = current_app.db.chat_sessions.insert_one(session_doc)
-    session_doc["_id"] = result.inserted_id
+        user_id = str(g.user_id) if getattr(g, "user_id", None) else None
+        is_guest = user_id is None
 
-    return jsonify({"session": ChatSessionModel.to_public(session_doc)}), 201
+        session_doc = ChatSessionModel.new(
+            user_id=user_id,
+            title=title,
+            book_ids=book_ids,
+            is_guest=is_guest,
+        )
+
+        if not session_doc.get("session_id"):
+            session_doc["session_id"] = str(uuid.uuid4())
+
+        current_app.db.chat_sessions.insert_one(session_doc)
+
+        clean_session = _sanitize_doc(session_doc)
+        
+        if hasattr(ChatSessionModel, "to_public"):
+            public_data = ChatSessionModel.to_public(clean_session)
+        else:
+            public_data = clean_session
+
+        return jsonify({"session": _sanitize_doc(public_data)}), 201
+
+    except Exception as e:
+        current_app.logger.error(f"Error creating chat session: {str(e)}", exc_info=True)
+        return jsonify({
+            "error": "Could not start chat session",
+            "details": str(e)
+        }), 500
 
 
 @chat_bp.post("/sessions/<session_id>/message")
 @optional_auth
 def send_message(session_id: str):
     """
-    Send a message and get a streaming SSE response.
-
-    Body: { message: str, book_ids?: [str], stream?: bool }
-    Returns: Server-Sent Events stream or JSON response.
+    Send a message and stream back response via SSE.
     """
     data = request.get_json(silent=True) or {}
     user_message = (data.get("message") or "").strip()
@@ -57,24 +91,23 @@ def send_message(session_id: str):
         return jsonify({"error": "Message cannot be empty"}), 400
 
     db = current_app.db
+    user_id = str(g.user_id) if getattr(g, "user_id", None) else None
 
-    # Find session (guests can access by session_id without user_id check)
     query = {"session_id": session_id}
-    if g.user_id:
-        query["user_id"] = g.user_id
+    if user_id:
+        query["user_id"] = user_id
 
     session = db.chat_sessions.find_one(query)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
-    # Use session's book_ids if not overridden in request
+    # Default to session book_ids if omitted
     if book_ids is None:
         book_ids = session.get("book_ids", [])
 
-    # Use authenticated user_id, or fall back to session's user_id (guest)
-    effective_user_id = g.user_id or str(session.get("user_id") or "guest")
+    effective_user_id = user_id or str(session.get("user_id") or "guest")
 
-    # Save user message to DB
+    # Save user message to database
     user_msg = ChatSessionModel.new_message(
         role=MessageRole.USER,
         content=user_message,
@@ -87,11 +120,9 @@ def send_message(session_id: str):
         },
     )
 
-    # Fetch recent history for context
-    history = session.get("messages", [])[-12:]  # last 6 turns
+    history = session.get("messages", [])[-12:]
 
-    if use_stream and book_ids:
-        # ── Streaming SSE response ─────────────────────────────
+    if use_stream:
         def generate():
             full_response = ""
             sources = []
@@ -108,10 +139,10 @@ def send_message(session_id: str):
                     full_response += token
                     yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
             except Exception as e:
+                current_app.logger.error(f"Streaming error: {e}", exc_info=True)
                 yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
                 return
 
-            # Save assistant message
             assistant_msg = ChatSessionModel.new_message(
                 role=MessageRole.ASSISTANT,
                 content=full_response,
@@ -136,28 +167,14 @@ def send_message(session_id: str):
             },
         )
     else:
-        # ── Non-streaming fallback (or no book context) ────────
-        if book_ids:
-            result = answer_question(
-                user_id=effective_user_id,
-                book_ids=book_ids,
-                question=user_message,
-                chat_history=history,
-            )
-            answer = result["answer"]
-            sources = result["sources"]
-        else:
-            # General chat without book context — still use Groq
-            from app.services.rag_service import _build_llm
-            from langchain.prompts import ChatPromptTemplate
-            llm = _build_llm()
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", "You are Saha, an enthusiastic AI book companion. Help the user explore literature."),
-                ("human", "{question}"),
-            ])
-            response = (prompt | llm).invoke({"question": user_message})
-            answer = response.content
-            sources = []
+        result = answer_question(
+            user_id=effective_user_id,
+            book_ids=book_ids,
+            question=user_message,
+            chat_history=history,
+        )
+        answer = result["answer"]
+        sources = result.get("sources", [])
 
         assistant_msg = ChatSessionModel.new_message(
             role=MessageRole.ASSISTANT,
@@ -179,14 +196,22 @@ def send_message(session_id: str):
 def list_sessions():
     """List all chat sessions for authenticated user."""
     db = current_app.db
+    user_id = str(g.user_id) if getattr(g, "user_id", None) else None
+
     sessions = db.chat_sessions.find(
-        {"user_id": g.user_id},
-        {"messages": {"$slice": -1}},  # only last message for preview
+        {"user_id": user_id},
+        {"messages": {"$slice": -1}},
         sort=[("updated_at", -1)],
     )
-    return jsonify({
-        "sessions": [ChatSessionModel.to_public(s) for s in sessions]
-    })
+    
+    clean_sessions = []
+    for s in sessions:
+        s = _sanitize_doc(s)
+        if hasattr(ChatSessionModel, "to_public"):
+            s = ChatSessionModel.to_public(s)
+        clean_sessions.append(_sanitize_doc(s))
+
+    return jsonify({"sessions": clean_sessions})
 
 
 @chat_bp.get("/sessions/<session_id>")
@@ -194,15 +219,21 @@ def list_sessions():
 def get_session(session_id: str):
     """Get full session with all messages."""
     db = current_app.db
+    user_id = str(g.user_id) if getattr(g, "user_id", None) else None
+
     query = {"session_id": session_id}
-    if g.user_id:
-        query["user_id"] = g.user_id
+    if user_id:
+        query["user_id"] = user_id
 
     session = db.chat_sessions.find_one(query)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
-    return jsonify({"session": ChatSessionModel.to_public(session)})
+    clean_session = _sanitize_doc(session)
+    if hasattr(ChatSessionModel, "to_public"):
+        clean_session = ChatSessionModel.to_public(clean_session)
+
+    return jsonify({"session": _sanitize_doc(clean_session)})
 
 
 @chat_bp.delete("/sessions/<session_id>")
@@ -210,8 +241,10 @@ def get_session(session_id: str):
 def delete_session(session_id: str):
     """Delete a chat session."""
     db = current_app.db
+    user_id = str(g.user_id) if getattr(g, "user_id", None) else None
+
     result = db.chat_sessions.delete_one(
-        {"session_id": session_id, "user_id": g.user_id}
+        {"session_id": session_id, "user_id": user_id}
     )
     if result.deleted_count == 0:
         return jsonify({"error": "Session not found"}), 404

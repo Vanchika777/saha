@@ -1,24 +1,21 @@
 """
 RAG service: LangChain + Groq LLM for book question-answering.
-Supports single-book and multi-book retrieval.
+Supports single-book, multi-book retrieval, and general literary conversation.
 """
 from typing import List, Optional, Generator
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.config import Config
 from app.utils.embedder import query_collection, query_multiple_collections
 
 # ── System prompt ────────────────────────────────────────────
-SYSTEM_PROMPT = """You are Saha, an expert AI book companion. You help users explore, understand, and discuss books with deep insight and enthusiasm.
+SYSTEM_PROMPT = """You are Saha, a warm, enthusiastic, and knowledgeable AI book companion.
 
-You have access to the actual content of the user's books through retrieved passages. When answering:
-- Ground your answers in the retrieved passages when relevant
-- Cite the book title when referencing specific content
-- Be conversational, insightful, and intellectually engaging
-- If a question isn't covered by the retrieved passages, you may use your general knowledge but be transparent about it
-- For questions about themes, characters, or plot — be thoughtful and literary in your analysis
+Your role:
+- Respond warmly to greetings, casual chatter, and general questions about literature, reading habits, authors, or genres.
+- When book context is provided, ground your detailed analysis in the retrieved passages and cite the book titles.
+- When NO book context is available (or the user is just saying hello), be conversational, friendly, and invite them to discuss their favorite books, ask for recommendations, or upload a book to analyze!
 
 Context from books:
 {context}
@@ -42,7 +39,7 @@ def _build_llm(streaming: bool = False) -> ChatGroq:
 def _format_context(chunks: List[dict]) -> str:
     """Format retrieved chunks into a readable context block."""
     if not chunks:
-        return "No specific book content retrieved for this query."
+        return "No specific book content attached. Engage in friendly conversation, answer general literary queries, or welcome the user."
 
     parts = []
     for i, chunk in enumerate(chunks, 1):
@@ -58,7 +55,7 @@ def _format_history(messages: List[dict], max_turns: int = 6) -> str:
     if not messages:
         return "No previous conversation."
 
-    recent = messages[-max_turns * 2:]  # last N turns (user + assistant each)
+    recent = messages[-max_turns * 2:]  # last N turns
     parts = []
     for m in recent:
         role = m.get("role", "")
@@ -79,16 +76,17 @@ def answer_question(
     n_results: int = 5,
 ) -> dict:
     """
-    Non-streaming RAG answer.
-
-    Returns:
-        {answer: str, sources: [{book_title, chunk_index, text_snippet}]}
+    Non-streaming RAG or general answer.
     """
-    # Retrieve relevant chunks
-    if len(book_ids) == 1:
-        chunks = query_collection(user_id, book_ids[0], question, n_results)
-    else:
-        chunks = query_multiple_collections(user_id, book_ids, question, n_results_per_book=3)
+    chunks = []
+    if book_ids:
+        try:
+            if len(book_ids) == 1:
+                chunks = query_collection(user_id, book_ids[0], question, n_results)
+            else:
+                chunks = query_multiple_collections(user_id, book_ids, question, n_results_per_book=3)
+        except Exception:
+            chunks = []
 
     context = _format_context(chunks)
     history = _format_history(chat_history)
@@ -107,9 +105,8 @@ def answer_question(
         "question": question,
     })
 
-    answer = response.content
+    answer = getattr(response, "content", str(response))
 
-    # Build sources for citation display
     sources = [
         {
             "book_title": c.get("book_title"),
@@ -131,13 +128,20 @@ def stream_answer(
     n_results: int = 5,
 ) -> Generator[str, None, None]:
     """
-    Streaming RAG answer — yields token strings one by one.
-    Use with Flask SSE or SocketIO.
+    Streaming response generator. Safely handles both empty book selections (greetings/general chat)
+    and single/multi-book RAG queries.
     """
-    if len(book_ids) == 1:
-        chunks = query_collection(user_id, book_ids[0], question, n_results)
-    else:
-        chunks = query_multiple_collections(user_id, book_ids, question, n_results_per_book=3)
+    chunks = []
+    
+    # Safely perform vector query only if book_ids are actually selected
+    if book_ids and isinstance(book_ids, list) and len(book_ids) > 0:
+        try:
+            if len(book_ids) == 1:
+                chunks = query_collection(user_id, book_ids[0], question, n_results)
+            else:
+                chunks = query_multiple_collections(user_id, book_ids, question, n_results_per_book=3)
+        except Exception:
+            chunks = []
 
     context = _format_context(chunks)
     history = _format_history(chat_history)
@@ -156,4 +160,6 @@ def stream_answer(
         "question": question,
     }):
         if hasattr(chunk, "content") and chunk.content:
-            yield chunk.content
+            yield str(chunk.content)
+        elif isinstance(chunk, str) and chunk:
+            yield chunk

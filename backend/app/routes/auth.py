@@ -1,175 +1,154 @@
 """
-Auth routes: register, login, Google OAuth, logout, /me
+Authentication routes (Email + Password only).
+Handles user registration, login, token refresh, and profile retrieval.
 """
-from flask import Blueprint, request, jsonify, current_app, g
 from datetime import datetime, timezone
+import bcrypt
+import jwt
+from flask import Blueprint, request, jsonify
+from bson import ObjectId
 
 from app.config import Config
-from app.models.user import UserModel
-from app.utils.auth_helpers import generate_token, login_required
+from app.utils.db import get_db
 
-auth_bp = Blueprint("auth", __name__)
+auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
 
-@auth_bp.post("/register")
+def _hash_password(password: str) -> str:
+    """Hashes a plain text password using bcrypt."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _verify_password(password: str, hashed: str) -> bool:
+    """Verifies a plain text password against a stored hash."""
+    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+
+
+def _generate_token(user_id: str, email: str) -> str:
+    """Generates a JWT access token for authentication."""
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, Config.JWT_SECRET, algorithm="HS256")
+
+
+@auth_bp.route("/register", methods=["POST"])
 def register():
-    """Email + password registration."""
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
+    """Register a new user account with email and password."""
+    db = get_db()
+    data = request.get_json() or {}
+
+    email = data.get("email", "").strip().lower()
     password = data.get("password", "")
-    display_name = (data.get("display_name") or email.split("@")[0]).strip()
+    name = data.get("name", "").strip() or email.split("@")[0]
 
     if not email or not password:
         return jsonify({"error": "Email and password are required"}), 400
-    if len(password) < 8:
-        return jsonify({"error": "Password must be at least 8 characters"}), 400
 
-    db = current_app.db
-    if db.users.find_one({"email": email}):
-        return jsonify({"error": "Email already registered"}), 409
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters long"}), 400
 
-    from app import bcrypt
-    password_hash = bcrypt.generate_password_hash(password).decode("utf-8")
+    # Check if user already exists
+    existing_user = db.users.find_one({"email": email})
+    if existing_user:
+        return jsonify({"error": "An account with this email already exists"}), 409
 
-    user_doc = UserModel.new(
-        email=email,
-        display_name=display_name,
-        password_hash=password_hash,
-    )
+    hashed_pw = _hash_password(password)
+
+    # Construct user document
+    now = datetime.now(timezone.utc)
+    user_doc = {
+        "email": email,
+        "password_hash": hashed_pw,
+        "name": name,
+        "avatar_url": None,
+        "created_at": now,
+        "updated_at": now,
+        "reading_profile": {
+            "genres": {},
+            "authors": {},
+            "languages": {},
+        },
+    }
+
     result = db.users.insert_one(user_doc)
-    user_doc["_id"] = result.inserted_id
+    user_id = str(result.inserted_id)
 
-    token = generate_token(str(result.inserted_id), email)
+    token = _generate_token(user_id, email)
+
     return jsonify({
+        "message": "Account created successfully",
         "token": token,
-        "user": UserModel.to_public(user_doc),
+        "user": {
+            "id": user_id,
+            "email": email,
+            "name": name,
+            "avatar_url": None,
+        }
     }), 201
 
 
-@auth_bp.post("/login")
+@auth_bp.route("/login", methods=["POST"])
 def login():
-    """Email + password login."""
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
+    """Log in an existing user with email and password."""
+    db = get_db()
+    data = request.get_json() or {}
+
+    email = data.get("email", "").strip().lower()
     password = data.get("password", "")
 
     if not email or not password:
         return jsonify({"error": "Email and password are required"}), 400
 
-    db = current_app.db
     user = db.users.find_one({"email": email})
-    if not user or not user.get("password_hash"):
-        return jsonify({"error": "Invalid credentials"}), 401
+    if not user:
+        return jsonify({"error": "Invalid email or password"}), 401
 
-    from app import bcrypt
-    if not bcrypt.check_password_hash(user["password_hash"], password):
-        return jsonify({"error": "Invalid credentials"}), 401
+    if not user.get("password_hash") or not _verify_password(password, user["password_hash"]):
+        return jsonify({"error": "Invalid email or password"}), 401
 
-    token = generate_token(str(user["_id"]), email)
+    user_id = str(user["_id"])
+    token = _generate_token(user_id, email)
+
     return jsonify({
         "token": token,
-        "user": UserModel.to_public(user),
-    })
+        "user": {
+            "id": user_id,
+            "email": user["email"],
+            "name": user.get("name", ""),
+            "avatar_url": user.get("avatar_url"),
+        }
+    }), 200
 
 
-@auth_bp.get("/google")
-def google_login():
-    """Redirect user to Google OAuth consent screen."""
-    from authlib.integrations.flask_client import OAuth
-    # OAuth client is initialised lazily here to keep app factory clean
-    oauth = _get_oauth_client()
-    redirect_uri = Config.GOOGLE_REDIRECT_URI
-    return oauth.google.authorize_redirect(redirect_uri)
+@auth_bp.route("/me", methods=["GET"])
+def get_current_user():
+    """Fetch current logged-in user info using JWT token."""
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid authorization header"}), 401
 
-
-@auth_bp.get("/google/callback")
-def google_callback():
-    """Handle Google OAuth callback, create/update user, issue JWT."""
-    from authlib.integrations.flask_client import OAuth
-    oauth = _get_oauth_client()
+    token = auth_header.split(" ")[1]
 
     try:
-        token = oauth.google.authorize_access_token()
-        user_info = token.get("userinfo") or oauth.google.userinfo()
-    except Exception as e:
-        return jsonify({"error": "Google OAuth failed", "detail": str(e)}), 400
+        payload = jwt.decode(token, Config.JWT_SECRET, algorithms=["HS256"])
+        user_id = payload.get("sub")
+    except Exception:
+        return jsonify({"error": "Token is invalid or expired"}), 401
 
-    google_id = user_info.get("sub")
-    email = (user_info.get("email") or "").lower()
-    name = user_info.get("name") or email.split("@")[0]
-    avatar = user_info.get("picture")
+    db = get_db()
+    user = db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        return jsonify({"error": "User not found"}), 404
 
-    db = current_app.db
-    # Try to find existing user by google_id or email
-    user = db.users.find_one({"$or": [{"google_id": google_id}, {"email": email}]})
-
-    if user:
-        # Update google_id + avatar if missing
-        db.users.update_one(
-            {"_id": user["_id"]},
-            {"$set": {
-                "google_id": google_id,
-                "avatar_url": avatar,
-                "updated_at": datetime.now(timezone.utc),
-            }},
-        )
-        user["google_id"] = google_id
-    else:
-        user_doc = UserModel.new(
-            email=email,
-            display_name=name,
-            google_id=google_id,
-            avatar_url=avatar,
-        )
-        result = db.users.insert_one(user_doc)
-        user_doc["_id"] = result.inserted_id
-        user = user_doc
-
-    jwt_token = generate_token(str(user["_id"]), email)
-
-    # Redirect to frontend with token in query param (frontend stores it)
-    frontend_url = Config.FRONTEND_URL
-    return f"""
-    <script>
-      window.opener && window.opener.postMessage(
-        {{ type: 'GOOGLE_AUTH_SUCCESS', token: '{jwt_token}' }},
-        '{frontend_url}'
-      );
-      window.close();
-    </script>
-    """
-
-
-@auth_bp.get("/me")
-@login_required
-def me():
-    """Return the currently authenticated user's profile."""
-    return jsonify({"user": UserModel.to_public(g.user)})
-
-
-@auth_bp.post("/logout")
-def logout():
-    """Client-side logout — just confirm (token is stateless)."""
-    return jsonify({"message": "Logged out successfully"})
-
-
-# ── Helpers ───────────────────────────────────────────────────
-
-_oauth_instance = None
-
-
-def _get_oauth_client():
-    """Lazy OAuth client (avoids circular import with app factory)."""
-    global _oauth_instance
-    if _oauth_instance is None:
-        from authlib.integrations.flask_client import OAuth
-        from flask import current_app
-        _oauth_instance = OAuth(current_app)
-        _oauth_instance.register(
-            name="google",
-            client_id=Config.GOOGLE_CLIENT_ID,
-            client_secret=Config.GOOGLE_CLIENT_SECRET,
-            server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-            client_kwargs={"scope": "openid email profile"},
-        )
-    return _oauth_instance
+    return jsonify({
+        "user": {
+            "id": str(user["_id"]),
+            "email": user["email"],
+            "name": user.get("name", ""),
+            "avatar_url": user.get("avatar_url"),
+            "reading_profile": user.get("reading_profile", {}),
+        }
+    }), 200

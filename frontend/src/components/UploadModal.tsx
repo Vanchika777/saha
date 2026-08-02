@@ -11,6 +11,13 @@ export const UploadModal: React.FC = () => {
 
   if (!isUploadModalOpen) return null;
 
+  const handleClose = () => {
+    setFile(null);
+    setError('');
+    setLoading(false);
+    closeUploadModal();
+  };
+
   const handleFileDrop = (e: React.DragEvent) => {
     e.preventDefault();
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
@@ -43,19 +50,28 @@ export const UploadModal: React.FC = () => {
       const res = await api.post('/books/upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-      addBook(res.data.book);
-      toggleBookSelection(res.data.book.id);
-      closeUploadModal();
-      setFile(null);
+
+      if (res.data && res.data.book) {
+        addBook(res.data.book);
+        const newBookId = res.data.book.id || res.data.book._id;
+        if (newBookId) {
+          toggleBookSelection(newBookId);
+        }
+      }
+
+      handleClose();
     } catch (err: any) {
-      setError(err.response?.data?.detail || err.response?.data?.error || 'Failed to upload PDF book');
-    } finally {
+      setError(
+        err.response?.data?.detail ||
+        err.response?.data?.error ||
+        'Failed to upload PDF book'
+      );
       setLoading(false);
     }
   };
 
   return (
-    <div className="backdrop" onClick={closeUploadModal}>
+    <div className="backdrop" onClick={handleClose}>
       <div
         className="glass"
         style={{
@@ -70,12 +86,18 @@ export const UploadModal: React.FC = () => {
         onClick={(e) => e.stopPropagation()}
       >
         <button
-          onClick={closeUploadModal}
+          onClick={handleClose}
+          type="button"
+          aria-label="Close"
           style={{
             position: 'absolute',
             top: '20px',
             right: '20px',
             color: 'var(--color-text-muted)',
+            cursor: 'pointer',
+            border: 'none',
+            background: 'transparent',
+            zIndex: 10,
           }}
         >
           <X size={20} />
@@ -106,7 +128,6 @@ export const UploadModal: React.FC = () => {
           </div>
         )}
 
-        {/* Drop Zone */}
         <div
           onDragOver={(e) => e.preventDefault()}
           onDrop={handleFileDrop}
@@ -153,10 +174,10 @@ export const UploadModal: React.FC = () => {
           onClick={handleUpload}
         >
           {loading ? (
-            <>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
               <Loader2 size={18} className="spinner" />
-              <span>Uploading & Extracting Metadata...</span>
-            </>
+              <span>Uploading...</span>
+            </div>
           ) : (
             'Add Book to Library'
           )}

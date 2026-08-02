@@ -16,7 +16,7 @@ class Config:
     MONGO_DB_NAME: str = os.getenv("MONGO_DB_NAME", "saha")
 
     # ── JWT ──────────────────────────────────────────────────
-    JWT_SECRET: str = os.getenv("JWT_SECRET", "jwt-secret-change-in-production")
+    JWT_SECRET: str = os.getenv("JWT_SECRET", os.getenv("JWT_SECRET_KEY", "jwt-secret-change-in-production"))
     JWT_EXPIRY_HOURS: int = int(os.getenv("JWT_EXPIRY_HOURS", 72))
 
     # ── Google OAuth ─────────────────────────────────────────
@@ -31,11 +31,11 @@ class Config:
     R2_ACCESS_KEY_ID: str = os.getenv("R2_ACCESS_KEY_ID", "")
     R2_SECRET_ACCESS_KEY: str = os.getenv("R2_SECRET_ACCESS_KEY", "")
     R2_BUCKET_NAME: str = os.getenv("R2_BUCKET_NAME", "saha-books")
-    R2_PUBLIC_URL: str = os.getenv("R2_PUBLIC_URL", "")  # e.g. https://pub-xxx.r2.dev
+    R2_PUBLIC_URL: str = os.getenv("R2_PUBLIC_URL", "")
 
     # ── Groq ─────────────────────────────────────────────────
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
     # ── ChromaDB ─────────────────────────────────────────────
     CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
@@ -53,7 +53,7 @@ class Config:
     OPEN_LIBRARY_API: str = "https://openlibrary.org"
     GOOGLE_BOOKS_API: str = "https://www.googleapis.com/books/v1"
     GUTENBERG_API: str = "https://gutendex.com"
-    GOOGLE_BOOKS_API_KEY: str = os.getenv("GOOGLE_BOOKS_API_KEY", "")  # optional
+    GOOGLE_BOOKS_API_KEY: str = os.getenv("GOOGLE_BOOKS_API_KEY", "")
 
     # ── Upload Limits ────────────────────────────────────────
     MAX_PDF_SIZE_MB: int = int(os.getenv("MAX_PDF_SIZE_MB", 50))

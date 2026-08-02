@@ -1,18 +1,15 @@
 """
-Book service: orchestrates the full upload pipeline.
-  1. Upload PDF to R2 or local disk fallback
-  2. Parse metadata + extract cover
-  3. Fetch cover from APIs if not embedded
-  4. Upload cover
-  5. Save book document to MongoDB
-  6. Enqueue background embedding (or embed synchronously)
+Book service: fast cover-first upload pipeline.
+1. Save PDF file to storage.
+2. Extract metadata & cover artwork synchronously (~1 sec).
+3. Insert complete book doc into MongoDB with real cover & author.
+4. Return book object immediately to frontend (no 'Extracting...' / 'Indexing...' state).
+5. Silently offload heavy ChromaDB vector chunk embeddings to background thread.
 """
-import io
-from typing import Optional
+import threading
 from datetime import datetime, timezone
 from bson import ObjectId
 
-from app.config import Config
 from app.models.book import BookModel, EmbeddingStatus
 from app.utils.pdf_parser import parse_pdf
 from app.utils.cover_fetcher import fetch_cover_url
@@ -26,9 +23,11 @@ def create_book(
     original_filename: str,
 ) -> dict:
     """
-    Full book upload pipeline.
+    Cover-first upload pipeline:
+    Extracts cover & title instantly so response contains complete metadata,
+    then offloads vector indexing in the background.
     """
-    # ── 1. Upload PDF ─────────────────────────────────────────
+    # ── 1. Upload PDF File ──────────────────────────────────────
     pdf_key, _ = r2_storage.upload_file(
         pdf_bytes,
         content_type="application/pdf",
@@ -36,10 +35,28 @@ def create_book(
         extension="pdf",
     )
 
-    # ── 2. Parse PDF ──────────────────────────────────────────
+    # ── 2. Parse PDF Metadata & Cover Synchronously (~0.5 - 1s) ─
     parsed = parse_pdf(pdf_bytes)
 
-    # ── 3. Handle cover ───────────────────────────────────────
+    # Clean fallback title if parsing didn't find one
+    fallback_title = (
+        original_filename.rsplit('.', 1)[0]
+        .replace('-', ' ')
+        .replace('_', ' ')
+        .title()
+    )
+    final_title = (
+        parsed.title
+        if (parsed.title and len(parsed.title.strip()) > 0)
+        else fallback_title
+    )
+    final_author = (
+        parsed.author
+        if (parsed.author and len(parsed.author.strip()) > 0)
+        else "Unknown Author"
+    )
+
+    # ── 3. Extract or Fetch Cover Image Immediately ─────────────
     cover_key = None
     cover_url = None
 
@@ -51,43 +68,62 @@ def create_book(
             extension=parsed.cover_ext,
         )
     else:
+        # Fetch cover directly from Open Library / Google Books API
         cover_url = fetch_cover_url(
-            title=parsed.title,
-            author=parsed.author,
+            title=final_title,
+            author=final_author,
         )
 
-    # ── 4. Build and insert MongoDB document ──────────────────
+    # ── 4. Insert Complete Document into MongoDB ───────────────
     book_doc = BookModel.new(
         user_id=user_id,
         original_filename=original_filename,
         file_key=pdf_key,
         cover_key=cover_key,
         cover_url=cover_url,
-        title=parsed.title,
-        author=parsed.author,
+        title=final_title,
+        author=final_author,
         language=parsed.language,
         page_count=parsed.page_count,
         file_size_bytes=len(pdf_bytes),
     )
+    book_doc["embedding_status"] = EmbeddingStatus.PROCESSING
+
     result = db.books.insert_one(book_doc)
     book_id = str(result.inserted_id)
 
-    # ── 5. Update user reading profile ───────────────────────
+    # ── 5. Update User Reading Profile ────────────────────────
     _update_reading_profile(db, user_id, parsed)
 
-    # ── 6. Enqueue background embedding task ──────────────────
-    _enqueue_embedding(book_id, user_id, parsed.text_chunks, parsed.title)
+    # ── 6. Offload ONLY Heavy Vector Chunking to Background ─────
+    if parsed.text_chunks:
+        thread = threading.Thread(
+            target=_embed_chunks_background,
+            args=(book_id, user_id, parsed.text_chunks, final_title),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        db.books.update_one(
+            {"_id": result.inserted_id},
+            {
+                "$set": {
+                    "embedding_status": EmbeddingStatus.DONE,
+                    "embedding_chunk_count": 0,
+                }
+            },
+        )
 
-    # Return public representation
+    # ── 7. Return Complete Book Object with Real Cover & Author ──
     book_doc["_id"] = result.inserted_id
-    return BookModel.to_public(
-        book_doc,
-        file_url=r2_storage.get_presigned_url(pdf_key),
-    )
+    file_url = r2_storage.get_presigned_url(pdf_key) if pdf_key else ""
+
+    # Returns doc directly without invalid extra keyword arguments
+    return BookModel.to_public(book_doc, file_url=file_url)
 
 
 def _update_reading_profile(db, user_id: str, parsed) -> None:
-    """Increment genre/author/language counts in user profile (logged-in only)."""
+    """Increment genre/author/language counts in user profile."""
     updates = {}
     if parsed.language:
         updates[f"reading_profile.languages.{parsed.language}"] = 1
@@ -100,29 +136,22 @@ def _update_reading_profile(db, user_id: str, parsed) -> None:
             user_obj_id = ObjectId(user_id)
             db.users.update_one(
                 {"_id": user_obj_id},
-                {"$inc": updates, "$set": {"updated_at": datetime.now(timezone.utc)}},
+                {
+                    "$inc": updates,
+                    "$set": {"updated_at": datetime.now(timezone.utc)},
+                },
             )
         except Exception:
-            pass  # Guest user ID string, skip reading profile update
+            pass
 
 
-def _enqueue_embedding(
+def _embed_chunks_background(
     book_id: str, user_id: str, chunks: list, title: str
 ) -> None:
-    """Queue embedding job or embed synchronously."""
-    try:
-        from app.tasks import embed_book_task
-        embed_book_task.delay(book_id, user_id, chunks, title)
-    except Exception:
-        _embed_synchronously(book_id, user_id, chunks, title)
-
-
-def _embed_synchronously(
-    book_id: str, user_id: str, chunks: list, title: str
-) -> None:
-    from app.utils.embedder import embed_chunks
+    """Silent background worker that processes ChromaDB vector embeddings."""
     from pymongo import MongoClient
     from app.config import Config
+    from app.utils.embedder import embed_chunks
 
     kwargs = {}
     if Config.MONGO_URI.startswith("mongodb+srv://"):
@@ -136,10 +165,6 @@ def _embed_synchronously(
     db = client[Config.MONGO_DB_NAME]
 
     try:
-        db.books.update_one(
-            {"_id": ObjectId(book_id)},
-            {"$set": {"embedding_status": EmbeddingStatus.PROCESSING}},
-        )
         count = embed_chunks(user_id, book_id, chunks, title)
         db.books.update_one(
             {"_id": ObjectId(book_id)},
@@ -152,7 +177,7 @@ def _embed_synchronously(
             },
         )
     except Exception as e:
-        print(f"[Embedding Error]: {e}")
+        print(f"[Embedding Background Error for {book_id}]: {e}")
         db.books.update_one(
             {"_id": ObjectId(book_id)},
             {"$set": {"embedding_status": EmbeddingStatus.FAILED}},
