@@ -4,8 +4,8 @@ Supports single-book and multi-book retrieval.
 """
 from typing import List, Optional, Generator
 from langchain_groq import ChatGroq
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.config import Config
 from app.utils.embedder import query_collection, query_multiple_collections
