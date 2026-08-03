@@ -1,23 +1,46 @@
 """
 Embedder: converts text chunks → vectors → stores in ChromaDB.
-Uses sentence-transformers locally (CPU-friendly, no API key needed).
+Uses Hugging Face Inference API to keep RAM lightweight for cloud deployment.
 """
-from typing import List, Optional
-from sentence_transformers import SentenceTransformer
-import numpy as np
+from typing import List
+import os
+import requests
 
 from app.config import Config
 from app.utils.chroma_client import get_or_create_collection
 
-# ── Singleton embedding model (loaded once on first use) ─────
-_model: Optional[SentenceTransformer] = None
+HF_API_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{Config.EMBEDDING_MODEL}"
 
 
-def get_embedding_model() -> SentenceTransformer:
-    global _model
-    if _model is None:
-        _model = SentenceTransformer(Config.EMBEDDING_MODEL)
-    return _model
+def get_huggingface_embeddings(texts: List[str]) -> List[List[float]]:
+    """
+    Call Hugging Face Inference API for a list of strings and return vector embeddings.
+    """
+    api_key = Config.HUGGINGFACE_API_KEY
+    if not api_key:
+        raise ValueError("HUGGINGFACE_API_KEY or HF_TOKEN is missing in environment variables!")
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    payload = {
+        "inputs": texts,
+        "options": {"wait_for_model": True}
+    }
+
+    response = requests.post(HF_API_URL, headers=headers, json=payload)
+    if response.status_code != 200:
+        raise Exception(f"Hugging Face API Error ({response.status_code}): {response.text}")
+
+    results = response.json()
+    
+    # Ensure correct format for lists of embeddings
+    embeddings = []
+    for item in results:
+        # Handle token-level pooling if returned nested
+        if isinstance(item, list) and len(item) > 0 and isinstance(item[0], list):
+            item = [sum(col) / len(col) for col in zip(*item)]
+        embeddings.append(item)
+
+    return embeddings
 
 
 def embed_chunks(
@@ -25,37 +48,22 @@ def embed_chunks(
     book_id: str,
     chunks: List[str],
     book_title: str = "",
-    batch_size: int = 64,
+    batch_size: int = 32,
 ) -> int:
     """
-    Embed a list of text chunks and store them in ChromaDB.
-
-    Args:
-        user_id   : owner of the book
-        book_id   : MongoDB _id of the book document
-        chunks    : list of text strings to embed
-        book_title: stored as metadata for source attribution
-        batch_size: how many chunks to embed at once (memory management)
-
-    Returns:
-        Number of chunks stored.
+    Embed a list of text chunks via Hugging Face API and store them in ChromaDB.
     """
     if not chunks:
         return 0
 
-    model = get_embedding_model()
     collection = get_or_create_collection(user_id, book_id)
 
     total = 0
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i: i + batch_size]
 
-        # Generate embeddings
-        embeddings: np.ndarray = model.encode(
-            batch,
-            normalize_embeddings=True,  # cosine similarity works best normalised
-            show_progress_bar=False,
-        )
+        # Generate embeddings via Hugging Face API
+        embeddings = get_huggingface_embeddings(batch)
 
         # Build IDs and metadata
         ids = [f"{book_id}_chunk_{i + j}" for j in range(len(batch))]
@@ -71,7 +79,7 @@ def embed_chunks(
 
         collection.upsert(
             ids=ids,
-            embeddings=embeddings.tolist(),
+            embeddings=embeddings,
             documents=batch,
             metadatas=metadatas,
         )
@@ -88,19 +96,18 @@ def query_collection(
 ) -> List[dict]:
     """
     Query a single book's ChromaDB collection for relevant chunks.
-
-    Returns list of {text, book_id, book_title, chunk_index, distance}
     """
-    model = get_embedding_model()
     collection = get_or_create_collection(user_id, book_id)
 
-    query_embedding = model.encode(
-        [query_text], normalize_embeddings=True
-    ).tolist()
+    query_embedding = get_huggingface_embeddings([query_text])
+
+    count = collection.count()
+    if count == 0:
+        return []
 
     results = collection.query(
         query_embeddings=query_embedding,
-        n_results=min(n_results, collection.count()),
+        n_results=min(n_results, count),
         include=["documents", "metadatas", "distances"],
     )
 
@@ -138,6 +145,5 @@ def query_multiple_collections(
         except Exception:
             continue
 
-    # Sort by distance (lower = more similar in cosine space)
     all_results.sort(key=lambda x: x.get("distance", 1.0))
     return all_results

@@ -37,13 +37,12 @@ class Config:
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
+    # ── Hugging Face & Embeddings ────────────────────────────
+    HUGGINGFACE_API_KEY: str = os.getenv("HUGGINGFACE_API_KEY", os.getenv("HF_TOKEN", ""))
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
     # ── ChromaDB ─────────────────────────────────────────────
     CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
-
-    # ── Embeddings ───────────────────────────────────────────
-    EMBEDDING_MODEL: str = os.getenv(
-        "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-    )
 
     # ── Celery / Redis ───────────────────────────────────────
     CELERY_BROKER_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")

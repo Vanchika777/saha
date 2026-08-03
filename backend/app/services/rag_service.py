@@ -2,7 +2,7 @@
 RAG service: LangChain + Groq LLM for book question-answering.
 Supports single-book, multi-book retrieval, and general literary conversation.
 """
-from typing import List, Optional, Generator
+from typing import List, Generator
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -55,7 +55,7 @@ def _format_history(messages: List[dict], max_turns: int = 6) -> str:
     if not messages:
         return "No previous conversation."
 
-    recent = messages[-max_turns * 2:]  # last N turns
+    recent = messages[-max_turns * 2:]
     parts = []
     for m in recent:
         role = m.get("role", "")
@@ -75,11 +75,9 @@ def answer_question(
     chat_history: List[dict],
     n_results: int = 5,
 ) -> dict:
-    """
-    Non-streaming RAG or general answer.
-    """
+    """Non-streaming RAG or general answer."""
     chunks = []
-    if book_ids:
+    if book_ids and isinstance(book_ids, list) and len(book_ids) > 0:
         try:
             if len(book_ids) == 1:
                 chunks = query_collection(user_id, book_ids[0], question, n_results)
@@ -127,13 +125,9 @@ def stream_answer(
     chat_history: List[dict],
     n_results: int = 5,
 ) -> Generator[str, None, None]:
-    """
-    Streaming response generator. Safely handles both empty book selections (greetings/general chat)
-    and single/multi-book RAG queries.
-    """
+    """Streaming response generator."""
     chunks = []
     
-    # Safely perform vector query only if book_ids are actually selected
     if book_ids and isinstance(book_ids, list) and len(book_ids) > 0:
         try:
             if len(book_ids) == 1:
