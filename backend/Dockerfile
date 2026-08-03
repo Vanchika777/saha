@@ -13,9 +13,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Expose default port
 EXPOSE 5000
 
 ENV FLASK_ENV=production
-ENV PORT=5000
-
-CMD ["python", "run.py"]
+# Use shell form so $PORT environment variable is properly expanded
+CMD python run.py
